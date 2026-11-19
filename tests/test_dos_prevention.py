@@ -152,3 +152,33 @@ class TestDoSPrevention:
         assert isinstance(stmt.tokens[2], sql.Operation)
         assert stmt.value == sql_str
         _assert_group_values_consistent(stmt)
+
+    def test_comment_only_input_not_rescanned(self, monkeypatch):
+        """group_comments must not rescan the tail per comment token.
+
+        CVE-2026-71491: on comment-only input group_comments searched the
+        remaining tokens for a terminator once per comment token, so a
+        statement of n single-line comments cost O(n**2).
+        """
+        n = 500
+        sql_str = '-- c\n' * n
+
+        calls = [0]
+        original = sql.TokenList.token_not_matching
+
+        def counting(self, funcs, idx):
+            calls[0] += 1
+            return original(self, funcs, idx)
+
+        monkeypatch.setattr(sql.TokenList, 'token_not_matching', counting)
+        stmt = sqlparse.parse(sql_str)[0]
+
+        # Unpatched: one tail scan per comment token, i.e. n calls.
+        assert calls[0] < 10
+        assert stmt.value == sql_str
+        assert sqlparse.format(sql_str, strip_comments=True).strip() == ''
+
+    def test_comments_before_statement_still_grouped(self):
+        stmt = sqlparse.parse('-- a\n-- b\nSELECT 1')[0]
+        assert isinstance(stmt.tokens[0], sql.Comment)
+        assert stmt.tokens[0].value == '-- a\n-- b\n'
