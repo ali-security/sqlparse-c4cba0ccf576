@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 
+import sys
+
 import pytest
 
 import sqlparse
 from sqlparse import sql, tokens as T
 from sqlparse.compat import PY2
+from sqlparse.exceptions import SQLParseError
 
 
 def test_issue9():
@@ -406,3 +409,25 @@ def test_issue489_tzcasts():
     p = sqlparse.parse('select bar at time zone \'UTC\' as foo')[0]
     assert p.tokens[-1].has_alias() is True
     assert p.tokens[-1].get_alias() == 'foo'
+
+
+@pytest.fixture
+def limit_recursion():
+    curr_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(100)
+    yield
+    sys.setrecursionlimit(curr_limit)
+
+
+@pytest.mark.parametrize('nested_sql', [
+    '(' * 1000 + ')' * 1000,
+    'a[' * 1000 + ']' * 1000,
+], ids=['parenthesis', 'square_brackets'])
+def test_max_recursion(limit_recursion, nested_sql):
+    with pytest.raises(SQLParseError):
+        sqlparse.parse(nested_sql)
+
+
+def test_max_recursion_format(limit_recursion):
+    with pytest.raises(SQLParseError):
+        sqlparse.format('(' * 1000 + ')' * 1000, reindent=True)

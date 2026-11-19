@@ -43,3 +43,9 @@ elif PY2:
     string_types = (str, unicode,)
     from StringIO import StringIO
     file_types = (file, StringIO, TextIOBase)
+
+
+try:
+    RecursionError = RecursionError
+except NameError:  # Python < 3.5 raises a plain RuntimeError
+    RecursionError = RuntimeError

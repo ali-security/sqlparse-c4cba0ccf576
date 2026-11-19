@@ -9,8 +9,10 @@
 """filter"""
 
 from sqlparse import lexer
+from sqlparse.compat import RecursionError
 from sqlparse.engine import grouping
 from sqlparse.engine.statement_splitter import StatementSplitter
+from sqlparse.exceptions import SQLParseError
 
 
 class FilterStack(object):
@@ -24,22 +26,25 @@ class FilterStack(object):
         self._grouping = True
 
     def run(self, sql, encoding=None):
-        stream = lexer.tokenize(sql, encoding)
-        # Process token stream
-        for filter_ in self.preprocess:
-            stream = filter_.process(stream)
+        try:
+            stream = lexer.tokenize(sql, encoding)
+            # Process token stream
+            for filter_ in self.preprocess:
+                stream = filter_.process(stream)
 
-        stream = StatementSplitter().process(stream)
+            stream = StatementSplitter().process(stream)
 
-        # Output: Stream processed Statements
-        for stmt in stream:
-            if self._grouping:
-                stmt = grouping.group(stmt)
+            # Output: Stream processed Statements
+            for stmt in stream:
+                if self._grouping:
+                    stmt = grouping.group(stmt)
 
-            for filter_ in self.stmtprocess:
-                filter_.process(stmt)
+                for filter_ in self.stmtprocess:
+                    filter_.process(stmt)
 
-            for filter_ in self.postprocess:
-                stmt = filter_.process(stmt)
+                for filter_ in self.postprocess:
+                    stmt = filter_.process(stmt)
 
-            yield stmt
+                yield stmt
+        except RecursionError:
+            raise SQLParseError('Maximum recursion depth exceeded')
