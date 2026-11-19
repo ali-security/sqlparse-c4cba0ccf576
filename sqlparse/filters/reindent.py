@@ -10,6 +10,54 @@ from sqlparse import sql, tokens as T
 from sqlparse.compat import text_type
 from sqlparse.utils import offset, indent
 
+# Line state of an empty text, see _advance_line().
+_EMPTY_LINE = 0, 0, False
+
+
+def _advance_line(state, text):
+    """Returns the line state of ``prefix + text`` given that of *prefix*.
+
+    A line state ``(last, tail, cr)`` holds what ``_get_offset()`` needs to
+    know about the text in front of a token: ``last`` is the length of the
+    last item of the text's ``splitlines()`` (which drops a trailing line
+    break), ``tail`` the number of characters after the text's last line
+    break and ``cr`` whether the text ends in a carriage return, which a
+    following ``\\n`` joins into a single line break.
+    """
+    if not text:
+        return state
+    last, tail, cr = state
+    lines = text.splitlines()
+    if len(lines) == 1 and len(lines[0]) == len(text):
+        # No line break in here, the current line just grows.
+        tail += len(text)
+        return tail, tail, False
+    if len(lines) > 1:
+        last = len(lines[-1])
+    elif not (cr and text == u'\n'):
+        # A single line closed by a break.  splitlines() drops that break,
+        # so it's the line closed here that is measured.  (A '\n' that
+        # completes a '\r\n' break leaves the measured line unchanged.)
+        last = tail + len(lines[0])
+    # The sentinel keeps a trailing break from collapsing.
+    tail = len((text + u'.').splitlines()[-1]) - 1
+    return last, tail, text.endswith(u'\r')
+
+
+class _Loop(object):
+    """A running ``_process_default()`` loop over the sublists of *tlist*.
+
+    *child* is the sublist being processed, at index *idx*.  Nothing in
+    front of it changes anymore until the loop has finished, so the line
+    state there is cached in *known* as ``(idx, state)`` and only has to be
+    extended up to the next child.
+    """
+    __slots__ = ('tlist', 'idx', 'child', 'known')
+
+    def __init__(self, tlist):
+        self.tlist = tlist
+        self.idx = self.child = self.known = None
+
 
 class ReindentFilter(object):
     def __init__(self, width=2, char=' ', wrap_after=0, n='\n',
@@ -26,26 +74,82 @@ class ReindentFilter(object):
         self._curr_stmt = None
         self._last_stmt = None
         self._last_func = None
-
-    def _flatten_up_to_token(self, token):
-        """Yields all tokens up to token but excluding current."""
-        if token.is_group:
-            token = next(token.flatten())
-
-        for t in self._curr_stmt.flatten():
-            if t == token:
-                break
-            yield t
+        self._loops = {}
 
     @property
     def leading_ws(self):
         return self.offset + self.indent * self.width
 
+    def _current_line_len(self, token):
+        """Returns the width of what's already emitted on *token*'s line.
+
+        The tokens preceding *token* are visited last one first, so the walk
+        stops at the line break that starts the current line, or at the
+        sublist a running ``_process_default()`` loop has the line state
+        cached for.  Rebuilding the statement prefix from its start instead
+        made every caller O(statement), and the callers running once per
+        group (tuple lists, identifier lists) quadratic in the number of
+        groups -- a CPU exhaustion vector (CVE-2026-84305,
+        GHSA-cfqr-cjx5-5jcm).  The result is the length of the last item of
+        the prefix's ``splitlines()``, just as before.
+        """
+        parts = []  # values in front of token, last one first
+        node = token
+        while node is not self._curr_stmt and node.parent is not None:
+            parent = node.parent
+            loop = self._loops.get(id(parent))
+            if loop is not None and loop.child is node:
+                text = u''.join(reversed(parts))
+                return _advance_line(self._line_state(loop), text)[0]
+            # ``Token`` doesn't implement ``__eq__``, so ``index()`` is an
+            # identity lookup and safe against tokens sharing a value.
+            stack = parent.tokens[:parent.tokens.index(node)]
+            while stack:
+                prev_ = stack.pop()
+                if prev_.is_group:
+                    stack.extend(prev_.tokens)
+                    continue
+
+                value = prev_.value
+                if not value:
+                    continue
+                parts.append(value)
+                lines = value.splitlines()
+                if len(lines) == 1 and len(lines[0]) == len(value):
+                    # No break in here.  ``splitlines()`` hands back the
+                    # value itself in that case, so this costs no copy.
+                    continue
+                # Once a full line follows a break, the text in front of
+                # that break can't change the measured line anymore.
+                lines = u''.join(reversed(parts)).splitlines()
+                if len(lines) > 1:
+                    return len(lines[-1])
+            node = parent
+        return _advance_line(_EMPTY_LINE, u''.join(reversed(parts)))[0]
+
+    def _line_state(self, loop):
+        """Returns the line state in front of the sublist *loop* is at."""
+        loops = [loop]
+        while (loops[-1].known is None
+               and loops[-1].tlist is not self._curr_stmt):
+            # _process_default() only tracks a loop whose tlist is the
+            # sublist its enclosing loop is at.
+            loops.append(self._loops[id(loops[-1].tlist.parent)])
+
+        state = _EMPTY_LINE
+        for loop in reversed(loops):
+            start, state = loop.known or (0, state)
+            if start != loop.idx:
+                tokens = loop.tlist.tokens[start:loop.idx]
+                state = _advance_line(state, u''.join(
+                    leaf.value for token in tokens
+                    for leaf in token.flatten()))
+            loop.known = loop.idx, state
+        return state
+
     def _get_offset(self, token):
-        raw = u''.join(map(text_type, self._flatten_up_to_token(token)))
-        line = (raw or '\n').splitlines()[-1]
         # Now take current offset into account and return relative offset.
-        return len(line) - len(self.char * self.leading_ws)
+        return self._current_line_len(token) - len(self.char * self.leading_ws)
 
     def nl(self, offset=0):
         return sql.Token(
@@ -226,8 +330,25 @@ class ReindentFilter(object):
     def _process_default(self, tlist, stmts=True):
         self._split_statements(tlist) if stmts else None
         self._split_kwds(tlist)
-        for sgroup in tlist.get_sublists():
-            self._process(sgroup)
+
+        # From here on tlist's own tokens stay as they are and sublists are
+        # only changed while being processed, so the line state in front of
+        # the sublist being processed can be cached (see _line_state()).
+        loop = None
+        outer = self._loops.get(id(tlist.parent))
+        if (tlist is self._curr_stmt
+                or outer is not None and outer.child is tlist):
+            loop = self._loops[id(tlist)] = _Loop(tlist)
+        try:
+            for idx, sgroup in enumerate(tlist.tokens):
+                if not sgroup.is_group:
+                    continue
+                if loop is not None:
+                    loop.idx, loop.child = idx, sgroup
+                self._process(sgroup)
+        finally:
+            if loop is not None:
+                del self._loops[id(tlist)]
 
     def process(self, stmt):
         self._curr_stmt = stmt
