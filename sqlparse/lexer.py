@@ -14,7 +14,7 @@
 # and to allow some customizations.
 
 from sqlparse import tokens
-from sqlparse.keywords import SQL_REGEX
+from sqlparse.keywords import SQL_REGEX, find_delimited_spans
 from sqlparse.compat import text_type, file_types
 from sqlparse.utils import consume
 
@@ -55,8 +55,23 @@ class Lexer(object):
             raise TypeError(u"Expected text or file-like object, got {!r}".
                             format(type(text)))
 
+        delimited_spans = find_delimited_spans(text)
+        span_openers = delimited_spans.openers
+
         iterable = enumerate(text)
         for pos, char in iterable:
+            # Only positions the lexer actually reaches may open a
+            # dollar-quoted literal or a multiline comment; a delimiter
+            # inside a string literal or behind a "--" comment is skipped
+            # along with its surrounding token and never resolved.
+            if pos in span_openers:
+                resolved = delimited_spans.resolve(pos)
+                if resolved is not None:
+                    end, ttype = resolved
+                    yield ttype, text[pos:end]
+                    consume(iterable, end - pos - 1)
+                    continue
+
             for rexmatch, action in SQL_REGEX:
                 m = rexmatch(text, pos)
 

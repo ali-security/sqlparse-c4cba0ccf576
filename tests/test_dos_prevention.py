@@ -3,7 +3,8 @@
 
 import pytest
 import sqlparse
-from sqlparse import sql
+from sqlparse import keywords, lexer, sql
+from sqlparse import tokens as T
 from sqlparse.exceptions import SQLParseError
 
 
@@ -182,3 +183,54 @@ class TestDoSPrevention:
         stmt = sqlparse.parse('-- a\n-- b\nSELECT 1')[0]
         assert isinstance(stmt.tokens[0], sql.Comment)
         assert stmt.tokens[0].value == '-- a\n-- b\n'
+
+    def test_lexer_has_no_rescanning_delimiter_regex(self):
+        """No per-position lexer regex may scan ahead for a closing delimiter.
+
+        CVE-2026-59893 (GHSA-prg7-hcfm-mfcr): dollar-quoted literals and
+        multiline comments were matched with a lazy dot-all quantifier
+        terminated by a backreference or a literal delimiter, applied at
+        every text position by the lexer loop, so every unclosed opener
+        re-scanned the rest of the input.
+        """
+        for rexmatch, _ in keywords.SQL_REGEX:
+            pattern = rexmatch.__self__.pattern
+            assert '[\\s\\S]*?' not in pattern, pattern
+
+    @pytest.mark.parametrize('opener', ['$a{0}$x', '/* c{0}', '/*+ h{0}'])
+    def test_unclosed_delimiters_resolved_once_per_opener(
+            self, monkeypatch, opener):
+        """Each unclosed opener costs one lookup, not a rescan of the tail.
+
+        CVE-2026-59893: with many unique unclosed `$tag$` or `/*` openers
+        the lexer re-scanned the remaining input once per opener, O(n**2).
+        """
+        n = 2000
+        sql_str = ' '.join(opener.format(i) for i in range(n))
+
+        calls = [0]
+        original = keywords.DelimitedSpans.resolve
+
+        def counting(self, pos):
+            calls[0] += 1
+            return original(self, pos)
+
+        monkeypatch.setattr(keywords.DelimitedSpans, 'resolve', counting)
+        stream = list(lexer.tokenize(sql_str))
+
+        assert calls[0] == n
+        assert u''.join(value for _, value in stream) == sql_str
+        assert not any(ttype in (T.Literal, T.Comment.Multiline)
+                       for ttype, _ in stream)
+
+    def test_many_unclosed_openers_still_pair_with_closer(self):
+        """Unclosed openers in between must not break delimiter pairing."""
+        n = 2000
+        body = ' '.join('/* c{0}'.format(i) for i in range(n)) + ' */'
+        stream = list(lexer.tokenize(body + ' SELECT 1'))
+        assert stream[0] == (T.Comment.Multiline, body)
+
+        body = '$q$ {0} $q$'.format(
+            ' '.join('$a{0}$x'.format(i) for i in range(n)))
+        stream = list(lexer.tokenize(body + ' SELECT 1'))
+        assert stream[0] == (T.Literal, body)
